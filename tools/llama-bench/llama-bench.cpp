@@ -334,6 +334,7 @@ struct cmd_params {
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
+    std::vector<std::string>         offload_moe;
     std::vector<llama_split_mode>    split_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
@@ -378,6 +379,7 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { 99 },
     /* n_cpu_moe            */ { 0 },
+    /* offload_moe          */ {},
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
@@ -448,6 +450,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  -omoe, --offload-moe <device/N>             (default: none)\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -719,6 +722,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "-omoe" || arg == "--offload-moe") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.offload_moe.insert(params.offload_moe.end(), p.begin(), p.end());
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1062,6 +1072,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_cpu_moe.empty()) {
         params.n_cpu_moe = cmd_params_defaults.n_cpu_moe;
     }
+    if (params.offload_moe.empty()) {
+        params.offload_moe = cmd_params_defaults.offload_moe;
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
     }
@@ -1117,6 +1130,31 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
 
+    // Validate --offload-moe format
+    if (!params.offload_moe.empty()) {
+        ggml_backend_load_all();
+        for (const auto & omoe : params.offload_moe) {
+            auto parts = string_split<std::string>(omoe, '/');
+            if (parts.size() != 2) {
+                fprintf(stderr, "error: --offload-moe expects <device/N> (e.g. 'cuda/8')\n");
+                invalid_param = true;
+                break;
+            }
+            auto * dev = ggml_backend_dev_by_name(parts[0].c_str());
+            if (!dev) {
+                fprintf(stderr, "error: invalid device for --offload-moe: %s\n", parts[0].c_str());
+                invalid_param = true;
+                break;
+            }
+            int n = std::stoi(parts[1]);
+            if (n < 0) {
+                fprintf(stderr, "error: --offload-moe N must be >= 0\n");
+                invalid_param = true;
+                break;
+            }
+        }
+    }
+
     return params;
 }
 
@@ -1142,6 +1180,7 @@ struct cmd_params_instance {
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+    std::string        offload_moe;
     bool               use_mmap;
     bool               use_direct_io;
     bool               embeddings;
@@ -1164,7 +1203,7 @@ struct cmd_params_instance {
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
 
-        if (n_cpu_moe <= 0) {
+        if (n_cpu_moe <= 0 && offload_moe.empty()) {
             if (tensor_buft_overrides.empty()) {
                 mparams.tensor_buft_overrides = nullptr;
             } else {
@@ -1172,6 +1211,41 @@ struct cmd_params_instance {
                             "Tensor buffer overrides not terminated with empty pattern");
                 mparams.tensor_buft_overrides = tensor_buft_overrides.data();
             }
+        } else if (!offload_moe.empty()) {
+            static std::vector<llama_model_tensor_buft_override> merged;
+            static std::vector<std::string> patterns;
+
+            merged.clear();
+            patterns.clear();
+
+            auto first = tensor_buft_overrides.begin();
+            auto last  = tensor_buft_overrides.end();
+            if (first != last && (last - 1)->pattern == nullptr) {
+                --last;
+            }
+            merged.insert(merged.end(), first, last);
+
+            auto parts = string_split<std::string>(offload_moe, '/');
+            auto * dev = ggml_backend_dev_by_name(parts[0].c_str());
+            int n = std::stoi(parts[1]);
+
+            patterns.reserve(n);
+            merged.reserve(merged.size() + n + 1);
+
+            for (int i = 0; i < n; ++i) {
+                patterns.push_back(llm_ffn_exps_block_regex(i));
+                merged.push_back({ patterns.back().c_str(), ggml_backend_dev_buffer_type(dev) });
+            }
+
+            // Also add n_cpu_moe CPU overrides if set
+            for (int i = 0; i < n_cpu_moe; ++i) {
+                patterns.push_back(llm_ffn_exps_block_regex(i));
+                merged.push_back({ patterns.back().c_str(), ggml_backend_cpu_buffer_type() });
+            }
+
+            merged.push_back({ nullptr, nullptr });
+
+            mparams.tensor_buft_overrides = merged.data();
         } else {
             static std::vector<llama_model_tensor_buft_override> merged;
             static std::vector<std::string> patterns;
@@ -1205,6 +1279,7 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               offload_moe == other.offload_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
@@ -1241,6 +1316,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
+    for (const auto & omoe : params.offload_moe)
     for (const auto & sm : params.split_mode)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
@@ -1288,6 +1364,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
+                /* .offload_moe    = */ omoe,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
@@ -1325,6 +1402,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
+                /* .offload_moe    = */ omoe,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
@@ -1362,6 +1440,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
+                /* .offload_moe    = */ omoe,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
@@ -1404,6 +1483,7 @@ struct test {
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+    std::string              offload_moe;
     bool                     use_mmap;
     bool                     use_direct_io;
     bool                     embeddings;
@@ -1444,6 +1524,7 @@ struct test {
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
+        offload_moe    = inst.offload_moe;
         use_mmap       = inst.use_mmap;
         use_direct_io  = inst.use_direct_io;
         embeddings     = inst.embeddings;
@@ -1510,7 +1591,8 @@ struct test {
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts",
+            "offload_moe"
         };
         return fields;
     }
@@ -1552,7 +1634,9 @@ struct test {
                 tensor_split_str += "/";
             }
         }
-        if (tensor_buft_overrides.size() == 1) {
+        if (!offload_moe.empty()) {
+            tensor_buft_overrides_str += offload_moe;
+        } else if (tensor_buft_overrides.size() == 1) {
             // Last element of tensor_buft_overrides is always a null pattern
             // so if it is only one element long, it must be a null pattern.
             GGML_ASSERT(tensor_buft_overrides[0].pattern == nullptr);
@@ -1612,7 +1696,8 @@ struct test {
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
-                                            std::to_string(stdev_ts()) };
+                                            std::to_string(stdev_ts()),
+                                            offload_moe };
         return values;
     }
 
@@ -1845,6 +1930,9 @@ struct markdown_printer : public printer {
         if (field == "tensor_split") {
             return "ts";
         }
+        if (field == "offload_moe") {
+            return "omoe";
+        }
         if (field == "tensor_buft_overrides") {
             return "ot";
         }
@@ -1871,6 +1959,9 @@ struct markdown_printer : public printer {
         }
         if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");
+        }
+        if (params.offload_moe.size() > 1 || !params.offload_moe.empty()) {
+            fields.emplace_back("offload_moe");
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
