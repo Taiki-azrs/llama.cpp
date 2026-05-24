@@ -2347,6 +2347,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--offload-moe"}, "<device>,N",
+        "offload the Mixture of Experts (MoE) weights of the first N layers to the specified device",
+        [](common_params & params, const std::string & value) {
+            auto parts = string_split<std::string>(value, ',');
+            if (parts.size() != 2) {
+                throw std::invalid_argument("expected <device>,N");
+            }
+            ggml_backend_load_all();
+            auto * dev = ggml_backend_dev_by_name(parts[0].c_str());
+            if (!dev) {
+                throw std::invalid_argument(string_format("invalid device: %s", parts[0].c_str()));
+            }
+            int n = std::stoi(parts[1]);
+            if (n < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            for (int i = 0; i < n; ++i) {
+                static std::list<std::string> buft_overrides;
+                buft_overrides.push_back(llm_ffn_exps_block_regex(i));
+                params.tensor_buft_overrides.push_back(llm_ffn_exps_buft_override(buft_overrides.back().c_str(), dev));
+            }
+        }
+    ).set_env("LLAMA_ARG_OFFLOAD_MOE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -3561,6 +3585,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--spec-draft-offload-moe", "--offload-moe-draft"}, "<device>,N",
+        "offload the Mixture of Experts (MoE) weights of the first N layers to the specified device for the draft model",
+        [](common_params & params, const std::string & value) {
+            auto parts = string_split<std::string>(value, ',');
+            if (parts.size() != 2) {
+                throw std::invalid_argument("expected <device>,N");
+            }
+            ggml_backend_load_all();
+            auto * dev = ggml_backend_dev_by_name(parts[0].c_str());
+            if (!dev) {
+                throw std::invalid_argument(string_format("invalid device: %s", parts[0].c_str()));
+            }
+            int n = std::stoi(parts[1]);
+            if (n < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            for (int i = 0; i < n; ++i) {
+                static std::list<std::string> buft_overrides_draft;
+                buft_overrides_draft.push_back(llm_ffn_exps_block_regex(i));
+                params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_buft_override(buft_overrides_draft.back().c_str(), dev));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_OFFLOAD_MOE"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",

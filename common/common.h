@@ -1034,6 +1034,10 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
 
+inline llama_model_tensor_buft_override llm_ffn_exps_buft_override(const char * pattern, ggml_backend_dev_t dev) {
+    return { pattern, ggml_backend_dev_buffer_type(dev) };
+}
+
 //
 // training utils
 //
