@@ -379,7 +379,7 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { 99 },
     /* n_cpu_moe            */ { 0 },
-    /* offload_moe          */ {},
+    /* offload_moe          */ {""},
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
@@ -1134,6 +1134,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (!params.offload_moe.empty()) {
         ggml_backend_load_all();
         for (const auto & omoe : params.offload_moe) {
+            if (omoe.empty()) { continue; }
             auto parts = string_split<std::string>(omoe, '/');
             if (parts.size() != 2) {
                 fprintf(stderr, "error: --offload-moe expects <device/N> (e.g. 'cuda/8')\n");
