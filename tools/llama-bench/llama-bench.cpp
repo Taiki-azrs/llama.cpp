@@ -1319,7 +1319,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & omoe : params.offload_moe)
     for (const auto & sm : params.split_mode)
     for (const auto & mg : params.main_gpu)
-    for (const auto & devs : params.devices)
+    for (const auto & devs : params.devices) {
     for (const auto & ts : params.tensor_split)
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & mmp : params.use_mmap)
@@ -1338,6 +1338,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
     for (const auto & pl : params.poll) {
+        if (!omoe.empty()) {
+            auto omoe_parts = string_split<std::string>(omoe, '/');
+            auto * omoe_dev = ggml_backend_dev_by_name(omoe_parts[0].c_str());
+            if (omoe_dev && std::find(devs.begin(), devs.end(), omoe_dev) == devs.end()) {
+                fprintf(stderr, "warning: skipping --offload-moe=%s (device %s not in scheduler backends)\n",
+                        omoe.c_str(), ggml_backend_dev_name(omoe_dev));
+                goto next_devs;
+            }
+        }
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
@@ -1451,6 +1460,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             };
             instances.push_back(instance);
         }
+    }
+  next_devs:;
     }
     // clang-format on
 
