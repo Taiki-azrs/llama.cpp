@@ -1188,6 +1188,7 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    std::vector<std::string> tensor_buft_override_pattern_strings;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1203,75 +1204,10 @@ struct cmd_params_instance {
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
 
-        if (n_cpu_moe <= 0 && offload_moe.empty()) {
-            if (tensor_buft_overrides.empty()) {
-                mparams.tensor_buft_overrides = nullptr;
-            } else {
-                GGML_ASSERT(tensor_buft_overrides.back().pattern == nullptr &&
-                            "Tensor buffer overrides not terminated with empty pattern");
-                mparams.tensor_buft_overrides = tensor_buft_overrides.data();
-            }
-        } else if (!offload_moe.empty()) {
-            static std::vector<llama_model_tensor_buft_override> merged;
-            static std::vector<std::string> patterns;
-
-            merged.clear();
-            patterns.clear();
-
-            auto first = tensor_buft_overrides.begin();
-            auto last  = tensor_buft_overrides.end();
-            if (first != last && (last - 1)->pattern == nullptr) {
-                --last;
-            }
-            merged.insert(merged.end(), first, last);
-
-            auto parts = string_split<std::string>(offload_moe, '/');
-            auto * dev = ggml_backend_dev_by_name(parts[0].c_str());
-            int n = std::stoi(parts[1]);
-
-            patterns.reserve(n);
-            merged.reserve(merged.size() + n + 1);
-
-            for (int i = 0; i < n; ++i) {
-                patterns.push_back(llm_ffn_exps_block_regex(i));
-                merged.push_back({ patterns.back().c_str(), ggml_backend_dev_buffer_type(dev) });
-            }
-
-            // Also add n_cpu_moe CPU overrides if set
-            for (int i = 0; i < n_cpu_moe; ++i) {
-                patterns.push_back(llm_ffn_exps_block_regex(i));
-                merged.push_back({ patterns.back().c_str(), ggml_backend_cpu_buffer_type() });
-            }
-
-            merged.push_back({ nullptr, nullptr });
-
-            mparams.tensor_buft_overrides = merged.data();
+        if (tensor_buft_overrides.empty()) {
+            mparams.tensor_buft_overrides = nullptr;
         } else {
-            static std::vector<llama_model_tensor_buft_override> merged;
-            static std::vector<std::string> patterns;
-
-            merged.clear();
-            patterns.clear();
-
-            auto first = tensor_buft_overrides.begin();
-            auto last  = tensor_buft_overrides.end();
-            if (first != last && (last - 1)->pattern == nullptr) {
-                --last;
-            }
-            merged.insert(merged.end(), first, last);
-
-            patterns.reserve((size_t) n_cpu_moe);
-            merged.reserve(merged.size() + (size_t) n_cpu_moe + 1);
-
-            for (int i = 0; i < n_cpu_moe; ++i) {
-                patterns.push_back(llm_ffn_exps_block_regex(i));
-                merged.push_back({ patterns.back().c_str(),
-                                ggml_backend_cpu_buffer_type() });
-            }
-
-            merged.push_back({ nullptr, nullptr });
-
-            mparams.tensor_buft_overrides = merged.data();
+            mparams.tensor_buft_overrides = tensor_buft_overrides.data();
         }
 
         return mparams;
@@ -2299,6 +2235,48 @@ int llama_bench(int argc, char ** argv) {
     }
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
+
+    // Merge --n-cpu-moe / --offload-moe into tensor_buft_overrides per instance
+    // so that pattern strings have proper lifetime (owned by the instance).
+    for (auto & inst : params_instances) {
+        if (inst.n_cpu_moe <= 0 && inst.offload_moe.empty()) {
+            continue;
+        }
+
+        inst.tensor_buft_override_pattern_strings.clear();
+        // Preserve existing overrides (minus the null terminator)
+        {
+            auto first = inst.tensor_buft_overrides.begin();
+            auto last  = inst.tensor_buft_overrides.end();
+            if (first != last && (last - 1)->pattern == nullptr) {
+                --last;
+            }
+            inst.tensor_buft_overrides = std::vector<llama_model_tensor_buft_override>(first, last);
+        }
+
+        if (!inst.offload_moe.empty()) {
+            auto parts = string_split<std::string>(inst.offload_moe, '/');
+            auto * dev = ggml_backend_dev_by_name(parts[0].c_str());
+            int n = std::stoi(parts[1]);
+
+            for (int i = 0; i < n; ++i) {
+                inst.tensor_buft_override_pattern_strings.push_back(llm_ffn_exps_block_regex(i));
+                inst.tensor_buft_overrides.push_back({
+                    inst.tensor_buft_override_pattern_strings.back().c_str(),
+                    ggml_backend_dev_buffer_type(dev) });
+            }
+        }
+
+        for (int i = 0; i < inst.n_cpu_moe; ++i) {
+            inst.tensor_buft_override_pattern_strings.push_back(llm_ffn_exps_block_regex(i));
+            inst.tensor_buft_overrides.push_back({
+                inst.tensor_buft_override_pattern_strings.back().c_str(),
+                ggml_backend_cpu_buffer_type() });
+        }
+
+        // Null terminator required by llama_model_load_from_file
+        inst.tensor_buft_overrides.push_back({ nullptr, nullptr });
+    }
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
